@@ -84,7 +84,7 @@ send_recv(Pid, ReqID, Packet, Timeout) ->
 init([PoolId, Host, Port]) ->
     case gen_tcp:connect(Host, Port, [binary, {active, true}, {nodelay, true}], ?TIMEOUT) of
         {ok, Socket} ->
-            {ok, #state{pool_id=PoolId, socket=Socket, requests=[], leftover = <<>>}};
+            {ok, #state{pool_id=PoolId, socket=Socket, requests={list, 0, []}, leftover = <<>>}};
         {error, Reason} ->
             {stop, {failed_to_open_socket, Reason}}
     end.
@@ -100,7 +100,7 @@ handle_cast(?send_recv(ReqID, Packet, From), State) ->
             {noreply, State};
         _ ->
             gen_tcp:send(State#state.socket, Packet),
-            State1 = State#state{requests=[{ReqID, From} | State#state.requests]},
+            State1 = State#state{requests=insert({ReqID, From}, State#state.requests)},
             {noreply, State1}
     end;
 
@@ -114,7 +114,7 @@ handle_cast(?send(Packet), State) ->
 
 
 handle_info(?abort(ReqId), #state{requests=Requests}=State) ->
-    State1 = State#state{requests=lists:keydelete(ReqId, 1, Requests)},
+    State1 = State#state{requests=keydelete(ReqId, Requests)},
     {noreply, State1};
 
 handle_info({tcp, _Socket, Data}, State) ->
@@ -147,12 +147,12 @@ process_bin(State, Bin) ->
         {Resp, Tail} ->
             ResponseTo = (Resp#response.header)#header.response_to,
 
-            case lists:keytake(ResponseTo, 1, State#state.requests) of
+            case keytake(ResponseTo, State#state.requests) of
                 false ->
                     cleanup_cursor(Resp, ResponseTo, State),
                     process_bin(State, Tail);
 
-                {value, {_, From}, Requests} ->
+                {From, Requests} ->
                     case is_aborted(ResponseTo) of
                         false ->
                             gen_server:reply(
@@ -179,3 +179,39 @@ cleanup_cursor(#response{cursor_id=0}, _, _) ->
 cleanup_cursor(#response{cursor_id=CursorID}, ReqId, State) ->
     Packet = emongo_packet:kill_cursors(ReqId, [CursorID]),
     gen_tcp:send(State#state.socket, Packet).
+
+%% Requests are stored either in gb_tree or list
+%% We start with list and convert it to gb_tree when more than 50 requests
+%% are waiting for response, and switch back to list when request count is less than 20
+insert(Element, {list, Length, List}) when Length < 50 ->
+    {list, Length + 1, [Element | List]};
+insert(Element, {list, Length, List}) ->
+    Tree = gb_trees:from_orddict(orddict:from_list([Element | List])),
+    {tree, Length + 1, Tree};
+insert({Key, Val}, {tree, Length, Tree}) ->
+    {tree, Length + 1, gb_trees:enter(Key, Val, Tree)}.
+
+keytake(Key, {list, Length, List}) ->
+    case lists:keytake(Key, 1, List) of
+        {value, {_, Val}, NewList} ->
+            {Val, {list, Length - 1, NewList}};
+        false ->
+            false
+    end;
+keytake(Key, {tree, Length, Tree}) ->
+    case gb_trees:lookup(Key, Tree) of
+        {value, Val} when Length > 20 ->
+            {Val, {tree, Length - 1, gb_trees:delete_any(Key, Tree)}};
+        {value, Val} ->
+            {Val, {list, Length - 1, gb_trees:to_list(gb_trees:delete_any(Key, Tree))}};
+        none ->
+            false
+    end.
+
+keydelete(Key, ListOrTree) ->
+    case keytake(Key, ListOrTree) of
+        {_, NewListOrTree} ->
+            NewListOrTree;
+        false ->
+            ListOrTree
+    end.
