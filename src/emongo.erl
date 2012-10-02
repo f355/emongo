@@ -436,11 +436,14 @@ delete_sync(PoolId, Collection, Selector, SyncOpts) ->
 %%------------------------------------------------------------------------------
 %% ensure_index(pool, "collection", [{"fieldname1", 1}, {"fieldname2", -1}]).
 ensure_index(PoolId, Collection, Keys) ->
-    ensure_index(PoolId, Collection, Keys, false).
+    ensure_index(PoolId, Collection, Keys, []).
 
-ensure_index(PoolId, Collection, Keys, Unique) ->
+%% Parameter Unique is deprecated, use [{"unique", true}] instead!
+ensure_index(PoolId, Collection, Keys, Unique) when is_boolean(Unique) ->
+    ensure_index(PoolId, Collection, Keys, [{"unique", true}]);
+ensure_index(PoolId, Collection, Keys, Opts) ->
     {Pid, Database, ReqId} = get_pid_pool(PoolId, 1),
-    Packet = emongo_packet:ensure_index(Database, Collection, ReqId, Keys, Unique),
+    Packet = emongo_packet:ensure_index(Database, Collection, ReqId, Keys, Opts),
     emongo_server:send(Pid, Packet).
 
 

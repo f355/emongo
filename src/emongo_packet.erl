@@ -95,13 +95,21 @@ delete(Database, Collection, ReqID, Selector) ->
 	Length = byte_size(Message),
     <<(Length+16):32/little-signed, ReqID:32/little-signed, 0:32, ?OP_DELETE:32/little-signed, Message/binary>>.
 
-ensure_index(Database, Collection, ReqID, Keys, Unique) ->
+ensure_index(Database, Collection, ReqID, Keys, Opts) ->
 	FullName = unicode:characters_to_binary([Database, ".system.indexes"]),
+        FilteredOpts = lists:filter(
+                         fun({Key, _})
+                               when Key =:= <<"name">>; Key =:= "name";
+                                    Key =:= <<"ns">>; Key =:= "ns";
+                                    Key =:= <<"key">>; Key =:= "key" ->
+                                 false;
+                            (_) ->
+                                 true
+                         end, Opts),
 	Selector = [
-		{<<"name">>, index_name(Keys, <<>>)},
-		{<<"ns">>, unicode:characters_to_binary([Database, ".", Collection])},
-		{<<"key">>, Keys},
-                {<<"unique">>, Unique}],
+                    {<<"name">>, index_name(Keys, <<>>)},
+                    {<<"ns">>, unicode:characters_to_binary([Database, ".", Collection])},
+                    {<<"key">>, Keys} | FilteredOpts],
 	EncodedDocument = emongo_bson:encode(Selector),
 	Message = <<0:32, FullName/binary, 0, EncodedDocument/binary>>,
 	Length = byte_size(Message),
