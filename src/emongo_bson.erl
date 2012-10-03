@@ -116,6 +116,10 @@ encode_key_value(Key, {datetime, Val}) ->
 	Epoch = (Date1 - Date2) * 1000,
 	<<9, Key1/binary, 0, Epoch:64/little-signed>>;
 
+encode_key_value(Key, {timestamp, Epoch}) ->
+    Key1 = encode_key(Key),
+    <<9, Key1/binary, 0, Epoch:64/little-signed>>;
+
 encode_key_value(Key, {{Year, Month, Day}, {Hour, Min, Secs}}) when is_integer(Year), is_integer(Month), is_integer(Day), is_integer(Hour), is_integer(Min), is_integer(Secs) ->
 	encode_key_value(Key, {datetime, {{Year, Month, Day}, {Hour, Min, Secs}}});
 
