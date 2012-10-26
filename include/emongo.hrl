@@ -8,7 +8,9 @@
           documents,
           pool_id
          }).
--record(emo_query, {opts=[], offset=0, limit=0, q=[], field_selector=[]}).
+-record(emo_query, {opts=[], offset=0, limit=0, slave_ok=false, q=[], field_selector=[]}).
+
+-define(LOGFUN_TABLE, emongo_logger_function).
 
 -define(TIMEOUT, 5000).
 

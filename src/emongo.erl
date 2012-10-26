@@ -26,7 +26,9 @@
 -module(emongo).
 -behaviour(gen_server).
 
--export([pools/0, oid/0, add_pool/5, del_pool/1, log_fun/1]).
+-export([pools/0, oid/0, add_pool/5, del_pool/1]).
+
+-export([log_fun/1, log_string/1]).
 
 -export([fold_all/6,
          find_all/2, find_all/3, find_all/4,
@@ -41,8 +43,10 @@
 
 -export([dec2hex/1, hex2dec/1]).
 
--export([sequence/2, synchronous/0, synchronous/1, no_response/0,
-         find_all_seq/3, fold_all_seq/5,
+-export([sequence/2, sequence/3,
+         synchronous/0, synchronous/1, no_response/0,
+         find_all_seq/3, find_all_seq/4,
+         fold_all_seq/5, fold_all_seq/6,
          insert_seq/3, update_seq/6, delete_seq/3]).
 
 -export([update_sync/5, update_sync/6, update_sync/7,
@@ -75,8 +79,6 @@
                        start_time,
                        result,
                        reason}).
-
--define(LOGFUN_TABLE, emongo_logger_function).
 
 %%====================================================================
 %% Types
@@ -115,11 +117,14 @@ log_fun(Fun) when is_function(Fun, 1) ->
 %% sequences of operations
 %%------------------------------------------------------------------------------
 
-sequence(_PoolId, []) ->
-    ok;
 sequence(PoolId, Sequence) ->
+    sequence(PoolId, Sequence, false).
+
+sequence(_PoolId, [], _SlaveOk) ->
+    ok;
+sequence(PoolId, Sequence, SlaveOk) ->
     StartTime = os:timestamp(),
-    try get_pid_pool(PoolId, length(Sequence)) of
+    try get_pid_pool(PoolId, length(Sequence), SlaveOk) of
         {Pid, Database, ReqId} ->
             sequence(Sequence, Pid, Database, ReqId, ReqId, PoolId)
     catch Class:Exception ->
@@ -136,8 +141,14 @@ sequence([Operation|Tail], Pid, Database, ReqId, SeqId, PoolId) ->
     StartTime = os:timestamp(),
     {Fun, RequestInfo} = case Operation of
                              {F, RI} ->
+                                 Database1 = case RI#request_info.database of
+                                                 undefined ->
+                                                     Database;
+                                                 OrigDB ->
+                                                     OrigDB
+                                             end,
                                  {F, RI#request_info{pid = Pid,
-                                                     database = Database,
+                                                     database = Database1,
                                                      req_id = ReqId,
                                                      orig_id = SeqId,
                                                      start_time = StartTime,
@@ -194,7 +205,7 @@ synchronous(Opts) ->
              Resp = emongo_server:send_recv(Pid, ReqId, PacketGetLastError, Timeout),
              Resp#response.documents
      end, #request_info{type = <<"getlasterror">>,
-                    options = Opts}}].
+                        options = Opts}}].
 
 no_response() ->
     [].
@@ -202,7 +213,7 @@ no_response() ->
 
 %% @spec find(PoolId, Collection, Selector, Options) -> Result
 %%   PoolId = atom()
-%%   Collection = string()
+%%   Collection = string() | {string(), string()}
 %%   Selector = document()
 %%   Options = [Option]
 %%   Option = {timeout, Timeout} | {limit, Limit} | {offset, Offset} | {orderby, Orderby} | {fields, Fields} | explain
@@ -227,11 +238,15 @@ find_all(PoolId, Collection, Selector) ->
     find_all(PoolId, Collection, Selector, []).
 
 find_all(PoolId, Collection, Selector, Options) ->
-    sequence(PoolId, find_all_seq(Collection, Selector, Options)).
-
+    SlaveOk = is_slaveok(Options),
+    sequence(PoolId, find_all_seq(Collection, Selector, Options, SlaveOk), SlaveOk).
 
 find_all_seq(Collection, Selector, Options) ->
-    [Fun0,{Fun1, RI}] = fold_all_seq(fun(I, A) -> [I | A] end, [], Collection, Selector, Options),
+    find_all_seq(Collection, Selector, Options, false).
+
+find_all_seq(Collection, Selector, Options, SlaveOk) ->
+    [Fun0,{Fun1, RI}] = fold_all_seq(fun(I, A) -> [I | A] end, [], Collection,
+                                     Selector, Options, SlaveOk),
 
     [Fun0,
      {fun(Pid, Database, ReqId) ->
@@ -251,16 +266,18 @@ find_and_remove(PoolId, Collection, Selector, Options) ->
     find_and_modify(PoolId, Collection, Selector, [{remove, true} | Options]).
 
 find_and_modify_seq(Collection, Selector, Options) ->
+    {Database1, Collection1} = collection(Collection),
+
     [fun(_, _, _) -> ok end,
      {fun(Pid, Database, ReqId) ->
               Selector1 = transform_selector(Selector),
-              Collection1 = unicode:characters_to_binary(Collection),
+              Database2 = is_null(Database1, Database),
 
               OptionsDoc = fam_options(Options, [{<<"query">>, Selector1}]),
               Query = #emo_query{q=[{<<"findandmodify">>, Collection1} | OptionsDoc],
                                  limit=1},
 
-              Packet = emongo_packet:do_query(Database, "$cmd",
+              Packet = emongo_packet:do_query(Database2, "$cmd",
                                               ReqId, Query),
               Resp = emongo_server:send_recv(Pid, ReqId, Packet,
                                              proplists:get_value(timeout, Options, ?TIMEOUT)),
@@ -268,7 +285,8 @@ find_and_modify_seq(Collection, Selector, Options) ->
                   true -> Resp;
                   false -> Resp#response.documents
               end
-      end, #request_info{collection = Collection,
+      end, #request_info{collection = Collection1,
+                         database = Database1,
                          selector = Selector,
                          options = Options,
                          type = <<"findandmodify">>}}].
@@ -278,54 +296,67 @@ find_and_modify_seq(Collection, Selector, Options) ->
 %% fold_all
 %%------------------------------------------------------------------------------
 fold_all(F, Value, PoolId, Collection, Selector, Options) ->
-    sequence(PoolId, fold_all_seq(F, Value, Collection, Selector, Options)).
-
+    SlaveOk = is_slaveok(Options),
+    sequence(PoolId, fold_all_seq(F, Value, Collection, Selector, Options, SlaveOk), SlaveOk).
 
 fold_all_seq(F, Value, Collection, Selector, Options) ->
+    fold_all_seq(F, Value, Collection, Selector, Options, false).
+
+fold_all_seq(F, Value, Collection, Selector, Options, SlaveOk) ->
     Timeout = proplists:get_value(timeout, Options, ?TIMEOUT),
     Query = create_query(Options, Selector),
+
+    {Database1, Collection1} = collection(Collection),
+
     [fun(_, _, _) -> ok end,
      {fun(Pid, Database, ReqId) ->
-             Packet = emongo_packet:do_query(Database, Collection, ReqId, Query),
-             Resp = emongo_server:send_recv(Pid, ReqId, Packet, Timeout),
+              Database2 = is_null(Database1, Database),
 
-             NewValue = fold_documents(F, Value, Resp),
-             case Query#emo_query.limit of
-                 0 ->
-                     fold_more(F, NewValue, Collection, Resp#response{documents=[]}, ReqId, Pid, Timeout);
-                 _ ->
-                     kill_cursor(Resp#response.pool_id, Resp#response.cursor_id),
-                     NewValue
-             end
-     end, #request_info{collection = Collection,
-                        selector = Selector,
-                        options = Options,
-                        type = <<"find">>}}].
+              Packet = emongo_packet:do_query(Database2, Collection1, ReqId, Query),
+              Resp = emongo_server:send_recv(Pid, ReqId, Packet, Timeout),
 
-fold_more(_F, Value, _Collection, #response{cursor_id=0}, _OrigReqId, _OrigPid, _Timeout) ->
+              NewValue = fold_documents(F, Value, Resp),
+              case Query#emo_query.limit of
+                  0 ->
+                      fold_more(F, NewValue, Collection, Resp#response{documents=[]}, ReqId, Pid, SlaveOk, Timeout);
+                  _ ->
+                      kill_cursor(Resp#response.pool_id, Resp#response.cursor_id),
+                      NewValue
+              end
+      end, #request_info{collection = Collection,
+                         database = Database1,
+                         selector = Selector,
+                         options = Options,
+                         type = <<"find">>}}].
+
+fold_more(_F, Value, _Collection, #response{cursor_id=0}, _OrigReqId, _OrigPid, _SlaveOk, _Timeout) ->
     Value;
 
 fold_more(F, Value, Collection, #response{pool_id=PoolId, cursor_id=CursorID},
-          OrigReqId, OrigPid, Timeout) ->
+          OrigReqId, OrigPid, SlaveOk, Timeout) ->
+
     RequestInfo = #request_info{pool_id = PoolId,
                                 orig_pid = OrigPid,
                                 orig_id = OrigReqId,
-                                collection = Collection,
                                 start_time = os:timestamp(),
                                 type = <<"get_more">>
                                },
-    try get_pid_pool(PoolId, 2) of
+    try get_pid_pool(PoolId, 2, SlaveOk) of
         {Pid, Database, ReqId} ->
+            {Database1, Collection1} = collection(Collection),
+            Database2 = is_null(Database1, Database),
+
             RequestInfo1 = RequestInfo#request_info{pid = Pid,
                                                     req_id = ReqId,
-                                                    database = Database},
-            Packet = emongo_packet:get_more(Database, Collection, ReqId, 0, CursorID),
+                                                    collection = Collection1,
+                                                    database = Database2},
+            Packet = emongo_packet:get_more(Database2, Collection1, ReqId, 0, CursorID),
             try emongo_server:send_recv(Pid, ReqId, Packet, Timeout) of
                 Resp1 ->
                     log(RequestInfo1#request_info{result = <<"ok">>}),
                     NewValue = fold_documents(F, Value, Resp1),
                     fold_more(F, NewValue, Collection, Resp1#response{documents=[]},
-                              OrigReqId, OrigPid, Timeout)
+                              OrigReqId, OrigPid, SlaveOk, Timeout)
             catch Class:Exception ->
                     log(RequestInfo1#request_info{result = Class,
                                                   reason = Exception}),
@@ -571,7 +602,10 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 get_pid_pool(PoolId, RequestCount) ->
-    case emongo_sup:worker_pid(PoolId, emongo_sup:pools(), RequestCount) of
+    get_pid_pool(PoolId, RequestCount, false).
+
+get_pid_pool(PoolId, RequestCount, SlaveOk) ->
+    case emongo_sup:worker_pid(PoolId, emongo_sup:pools(), RequestCount, SlaveOk) of
         undefined -> throw(emongo_busy);
         Val -> Val
     end.
@@ -609,47 +643,53 @@ log(#request_info{pool_id = PoolId,
                   result = Result,
                   reason = Reason}) ->
 
+    StringFun =
+        fun(Now) ->
+                ParamList = [{<<"pool">>, PoolId},
+                             {<<"pid">>, Pid},
+                             {<<"time">>, timer:now_diff(Now, StartTime)},
+                             {<<"rid">>, ReqId},
+                             {<<"opid">>, OrigPid},
+                             {<<"orid">>, OrigId},
+                             {<<"type">>, Type},
+                             {<<"db">>, Database},
+                             {<<"coll">>, Collection},
+                             {<<"sel">>, Selector},
+                             {<<"docs">>, Documents},
+                             {<<"opts">>, Options},
+                             {<<"res">>, Result},
+                             {<<"reason">>, Reason}],
+                FoldFun = fun({_, undefined}, Acc) ->
+                                  Acc;
+                             ({Key, Value}, Acc) ->
+                                  NormValue = if is_binary(Value) ->
+                                                      Value;
+                                                 is_integer(Value) ->
+                                                      integer_to_list(Value);
+                                                 is_atom(Value) ->
+                                                      atom_to_list(Value);
+                                                 true ->
+                                                      io_lib:format("~p", [Value])
+                                              end,
+                                  [$\t, NormValue, $=, Key | Acc]
+                          end,
+                lists:reverse(tl(lists:foldl(FoldFun, [], ParamList)))
+        end,
+    log_string(StringFun).
+
+log_string(StringFun) ->
     case catch ets:lookup(?LOGFUN_TABLE, log_fun) of
         [{_, Fun}] when is_function(Fun, 1) ->
             {_, _, MicroSec} = Now = os:timestamp(),
             {{Y, M, D}, {H, Mi, S}} = calendar:now_to_local_time(Now),
             TimeStr = io_lib:format("~4.10.0B-~2.10.0B-~2.10.0B ~2.10.0B:~2.10.0B:~2.10.0B.~6.10.0B",
                                     [Y, M, D, H, Mi, S, MicroSec]),
-            ParamList = [{<<"pool">>, PoolId},
-                          {<<"pid">>, Pid},
-                          {<<"time">>, timer:now_diff(Now, StartTime)},
-                          {<<"rid">>, ReqId},
-                          {<<"opid">>, OrigPid},
-                          {<<"orid">>, OrigId},
-                          {<<"type">>, Type},
-                          {<<"db">>, Database},
-                          {<<"coll">>, Collection},
-                          {<<"sel">>, Selector},
-                          {<<"docs">>, Documents},
-                          {<<"opts">>, Options},
-                          {<<"res">>, Result},
-                          {<<"reason">>, Reason}],
-            FoldFun = fun({_, undefined}, Acc) ->
-                              Acc;
-                         ({Key, Value}, Acc) ->
-                              NormValue = if is_binary(Value) ->
-                                                  Value;
-                                             is_integer(Value) ->
-                                                  integer_to_list(Value);
-                                             is_atom(Value) ->
-                                                  atom_to_list(Value);
-                                             true ->
-                                                  io_lib:format("~p", [Value])
-                                          end,
-                              [$\t, NormValue, $=, Key | Acc]
-                      end,
-            LogString = lists:reverse(tl(lists:foldl(FoldFun, [], ParamList))),
-            catch Fun(re:replace([<<"ts=">>, TimeStr, $\t, LogString], "\\n *", "", [global, {return, binary}])),
+
+            catch Fun(re:replace([<<"ts=">>, TimeStr, $\t, StringFun(Now)], "\\n *", "", [global, {return, binary}])),
             ok;
         _ ->
             ok
     end.
-
 
 dec2hex(Dec) ->
     dec2hex(<<>>, Dec).
@@ -703,13 +743,35 @@ create_query([{fields, Fields}|Options], QueryRec, QueryDoc, OptDoc) ->
 create_query([explain | Options], QueryRec, QueryDoc, OptDoc) ->
     create_query(Options, QueryRec, QueryDoc, [{<<"$explain">>,true}|OptDoc]);
 
-create_query([slave_ok | Options], QueryRec, QueryDoc, OptDoc) ->
+create_query([Opt | Options], QueryRec, QueryDoc, OptDoc)
+  when Opt =:= slave_ok;
+       Opt =:= {slave_ok, true};
+       Opt =:= {slave_ok, master_preferred};
+       Opt =:= {slave_ok, slave_preferred} ->
     Opts = QueryRec#emo_query.opts,
     QueryRec1 = QueryRec#emo_query{opts = lists:umerge([?SLAVE_OK], Opts)},
     create_query(Options, QueryRec1, QueryDoc, OptDoc);
 
+create_query([{slave_ok, Value} | Options], QueryRec, QueryDoc, OptDoc)
+  when Value =:= true;
+       Value =:= master_preferred;
+       Value =:= slave_preferred ->
+    create_query(Options, QueryRec#emo_query{slave_ok = Value}, QueryDoc, OptDoc);
+
 create_query([_|Options], QueryRec, QueryDoc, OptDoc) ->
     create_query(Options, QueryRec, QueryDoc, OptDoc).
+
+is_slaveok([]) ->
+    false;
+is_slaveok([slave_ok | _]) ->
+    true;
+is_slaveok([{slave_ok, Val}| _])
+  when Val =:= true;
+       Val =:= master_preferred;
+       Val =:= slave_preferred ->
+    Val;
+is_slaveok([_ | Options]) ->
+    is_slaveok(Options).
 
 fam_options([], OptDoc) -> OptDoc;
 fam_options([{sort, _} = Opt | Options], OptDoc) ->
@@ -726,6 +788,17 @@ fam_options([{upsert, _} = Opt | Options], OptDoc) ->
     fam_options(Options, [opt(Opt) | OptDoc]);
 fam_options([_ | Options], OptDoc) ->
     fam_options(Options, OptDoc).
+
+collection({Database, Collection}) ->
+    {unicode:characters_to_binary(Database),
+     unicode:characters_to_binary(Collection)};
+collection(Collection) ->
+    {undefined, unicode:characters_to_binary(Collection)}.
+
+is_null(undefined, Value) ->
+    Value;
+is_null(Value, _) ->
+    Value.
 
 opt({Atom, Val}) when is_atom(Atom) ->
     {list_to_binary(atom_to_list(Atom)), Val}.

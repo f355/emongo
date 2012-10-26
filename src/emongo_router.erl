@@ -6,9 +6,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/2, pid/1, pid/2]).
-
--deprecated([pid/1]).
+-export([start_link/2, pid/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -24,10 +22,7 @@
 -define(RECHECK_TIME, 9500).
 
 %% messages
--define(pid(RequestCount), {pid, RequestCount}).
-
-%% to be removed next release
--define(old_pid(), pid).
+-define(pid(RequestCount, SlaveOk), {pid, RequestCount, SlaveOk}).
 
 %%====================================================================
 %% API
@@ -40,12 +35,8 @@ start_link(BalId, Pools) ->
     gen_server:start_link(?MODULE, [BalId, Pools], []).
 
 
-pid(BalancerPid) ->
-    pid(BalancerPid, 1).
-
-
-pid(BalancerPid, RequestCount) ->
-    gen_server:call(BalancerPid, {pid, RequestCount}).
+pid(BalancerPid, RequestCount, SlaveOk) ->
+    gen_server:call(BalancerPid, ?pid(RequestCount, SlaveOk)).
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -72,12 +63,8 @@ init([BalId, Pools]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messagesp
 %%--------------------------------------------------------------------
-handle_call(?old_pid(), _From, State) ->
-    {Pid, NewState} = get_pid(State, emongo_sup:pools(), 1),
-    {reply, Pid, NewState};
-
-handle_call(?pid(RequestCount), _From, State) ->
-    {Pid, NewState} = get_pid(State, emongo_sup:pools(), RequestCount),
+handle_call(?pid(RequestCount, SlaveOk), _From, State) ->
+    {Pid, NewState} = get_pid(State, emongo_sup:pools(), RequestCount, SlaveOk),
     {reply, Pid, NewState};
 
 handle_call(stop_children, _, #state{id=BalId, active=Active, passive=Passive}=State) ->
@@ -150,17 +137,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 
-get_pid(#state{id=BalId, active=Active, passive=Passive, timer=Timer}=State, Pools, RequestCount) ->
+get_pid(#state{id=BalId, active=Active, passive=Passive, timer=Timer}=State,
+        Pools, RequestCount, SlaveOk) ->
     case Active of
         [PoolIdx | Active2] ->
-            case emongo_sup:worker_pid(?POOL_ID(BalId, PoolIdx), Pools, RequestCount) of
+            case emongo_sup:worker_pid(?POOL_ID(BalId, PoolIdx), Pools, RequestCount, SlaveOk) of
                 undefined ->
                     error_logger:info_msg("pool ~p is disabled!~n", [?POOL_ID(BalId, PoolIdx)]),
 
                     get_pid(State#state{active=Active2,
                                         passive=[PoolIdx | Passive],
                                         timer=set_timer(Timer)
-                                       }, Pools, RequestCount);
+                                       }, Pools, RequestCount, SlaveOk);
                 Pid ->
                     {Pid, State}
             end;
@@ -182,7 +170,7 @@ activate(#state{passive=[]}=State, Passive, _) ->
     State#state{passive=Passive, timer=erlang:send_after(?RECHECK_TIME, self(), recheck)};
 
 activate(#state{id=BalId, active=Active, passive=[PoolIdx | Passive]}=State, Acc, Pools) ->
-    case emongo_sup:worker_pid(?POOL_ID(BalId, PoolIdx), Pools, 0) of
+    case emongo_sup:worker_pid(?POOL_ID(BalId, PoolIdx), Pools, 0, master_preferred) of
         undefined ->
             activate(State#state{passive=Passive}, [PoolIdx | Acc], Pools);
         _ ->

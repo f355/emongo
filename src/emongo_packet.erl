@@ -23,8 +23,9 @@
 -module(emongo_packet).
 
 -export([update/7, insert/4, do_query/4, get_more/5, 
-		 delete/4, kill_cursors/2, msg/2, decode_response/1,
-		 ensure_index/5, get_last_error/2, server_status/2]).
+         delete/4, kill_cursors/2, msg/2, decode_response/1,
+         ensure_index/5, get_last_error/2, server_status/2,
+         is_master/1, rs_status/1]).
 
 -include("emongo.hrl").
 
@@ -45,6 +46,17 @@ server_status(Database, ReqId) ->
      ?OP_QUERY:32/little-signed, 0:32, Database/binary, ".$cmd", 0, 0:32, 1:32/little-signed,
      %% Encoded document
      23:32/little-signed, 16, "serverStatus", 0, 1:32/little-signed, 0>>.
+
+is_master(ReqId) ->
+    <<58:32/little-signed, ReqId:32/little-signed, 0:32,
+      ?OP_QUERY:32/little-signed, 0:32, "admin.$cmd", 0, 0:32, 1:32/little-signed,
+      19:32/little-signed, 16, "isMaster", 0, 1:32/little-signed, 0>>.
+
+rs_status(ReqId) ->
+    <<66:32/little-signed, ReqId:32/little-signed, 0:32,
+      ?OP_QUERY:32/little-signed, 0:32, "admin.$cmd", 0, 0:32, 1:32/little-signed,
+      27:32/little-signed, 16, "replSetGetStatus", 0, 1:32/little-signed, 0>>.
+
 
 update(Database, Collection, ReqID, Upsert, MultiUpdate, Selector, Document) ->
 	FullName = unicode:characters_to_binary([Database, ".", Collection]),

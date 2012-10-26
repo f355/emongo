@@ -6,9 +6,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/5, pid/1, pid/2]).
-
--deprecated([pid/1]).
+-export([start_link/5, start_link/6, pid/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -26,6 +24,7 @@
                size,
                active=true,
                poll=none,
+               max_repl_lag,
                conn_pid=pqueue:new(),
                req_id=1}).
 
@@ -34,22 +33,20 @@
 -define(poll(), poll).
 -define(poll_timeout(Pid, ReqId, Tag), {poll_timeout, Pid, ReqId, Tag}).
 
-%% to be removed next release
--define(old_pid(), pid).
-
 
 %%%%%%%%%%%%%%%%
 %% public api %%
 %%%%%%%%%%%%%%%%
 
 start_link(PoolId, Host, Port, Database, Size) ->
-    gen_server:start_link(?MODULE, [PoolId, Host, Port, Database, Size], []).
+    start_link(PoolId, Host, Port, Database, Size, []).
 
-pid(Pid) ->
-    gen_server:call(Pid, pid).
+start_link(PoolId, Host, Port, Database, Size, Opts) ->
+    gen_server:start_link(?MODULE, [PoolId, Host, Port, Database, Size, Opts], []).
 
-pid(Pid, RequestCount) ->
-    gen_server:call(Pid, {pid, RequestCount}).
+
+pid(Pid, RequestCount, _SlaveOk) ->
+    gen_server:call(Pid, ?pid(RequestCount)).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%
 %% gen_server callbacks %%
@@ -62,14 +59,22 @@ pid(Pid, RequestCount) ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
-init([PoolId, Host, Port, Database, Size]) ->
+init([PoolId, Host, Port, Database, Size, Opts]) ->
     process_flag(trap_exit, true),
+
+    MaxReplLag = case lists:keyfind(max_repl_lag, 1, Opts) of
+                     {_, MaxLag} ->
+                         MaxLag;
+                     _ ->
+                         undefined
+                 end,
 
     Pool0 = #pool{id = PoolId,
                   host = Host,
                   port = Port,
                   database = unicode:characters_to_binary(Database),
-                  size = Size
+                  size = Size,
+                  max_repl_lag = MaxReplLag
                  },
 
     {noreply, Pool} = handle_info(?poll(), Pool0),
@@ -84,10 +89,6 @@ init([PoolId, Host, Port, Database, Size]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call(?old_pid(), _From, #pool{active=true}=State) ->
-    {Reply, NewState} = get_pid(State, 1),
-    {reply, Reply, NewState};
-
 handle_call(?pid(RequestCount), _From, #pool{active=true}=State) ->
     {Reply, NewState} = get_pid(State, RequestCount),
     {reply, Reply, NewState};
@@ -115,6 +116,7 @@ handle_info({'EXIT', Pid, Reason}, #pool{conn_pid=Pids}=State) ->
                            [State#pool.id, Reason]),
 
     Pids1 = pqueue:filter(fun(Item) -> Item =/= Pid end, Pids),
+    log(State, <<"deactivated">>, io_lib:format("disconnected\tconn_pid=~p", [Pid])),
     {noreply, State#pool{conn_pid = Pids1, active=false}};
 
 handle_info(?poll(), State) ->
@@ -124,19 +126,22 @@ handle_info(?poll(), State) ->
 
 handle_info(?poll_timeout(Pid, ReqId, Tag), #pool{poll={Tag, _}}=State) ->
     case catch emongo_server:recv(Pid, ReqId, 0, Tag) of
-        #response{} ->
-            {noreply, State#pool{active=true, poll=none}};
+        #response{} = Resp ->
+            NewState = poll_reply(Resp, State),
+            {noreply, NewState};
         _ ->
+            log(State, <<"deactivated">>, <<"noreply">>),
             {noreply, State#pool{active=false, poll=none}}
     end;
 
-handle_info({Tag, _}, #pool{poll={Tag, TimerRef}}=State) ->
+handle_info({Tag, Response}, #pool{poll = {Tag, TimerRef}} = State) ->
     _Time = erlang:cancel_timer(TimerRef),
+    NewState = poll_reply(Response, State),
     %%io:format("polling ~p success: ~p~n", [State#pool.id, Time]),
-    {noreply, State#pool{active=true, poll=none}};
+    {noreply, NewState};
 
 handle_info(Info, State) ->
-    error_logger:info_msg("Pool ~p unknown message: ~p~n",
+    error_logger:info_msg("Pool ~p unknown message:~n~p",
                            [State#pool.id, Info]),
 
     {noreply, State}.
@@ -193,21 +198,93 @@ do_open_connections(#pool{conn_pid=Pids, size=Size}=Pool) ->
         true ->
             case emongo_server:start_link(Pool#pool.id, Pool#pool.host, Pool#pool.port) of
                 {error, _Reason} ->
+                    log(Pool, <<"deactivated">>, <<"cannot_connect">>),
                     Pool#pool{active=false};
                 {ok, Pid} ->
+                    log(Pool, <<"connected">>, pid_to_list(Pid)),
                     do_open_connections(Pool#pool{conn_pid = pqueue:push(1, Pid, Pids)})
             end;
         false ->
             do_poll(Pool)
     end.
 
-do_poll(Pool) ->
+do_poll(#pool{max_repl_lag = MaxReplLag} = Pool) ->
     case get_pid(Pool, 2) of
         {{Pid, Database, ReqId}, NewPool} ->
-            PacketLast = emongo_packet:get_last_error(Database, ReqId),
+            PacketLast = packet(Database, ReqId, MaxReplLag),
             Tag = emongo_server:send_recv_nowait(Pid, ReqId, PacketLast),
             TimerRef = erlang:send_after(?POLL_TIMEOUT, self(), ?poll_timeout(Pid, ReqId, Tag)),
             NewPool#pool{poll={Tag, TimerRef}};
         _ ->
+            log(Pool, <<"deactivated">>, <<"no_connections">>),
             Pool#pool{active=false}
     end.
+
+poll_reply(_, #pool{active = Active, max_repl_lag = undefined} = Pool) ->
+    if Active =:= false ->
+            log(Pool, <<"activated">>, <<"connected">>);
+       true ->
+            ok
+    end,
+    Pool#pool{active = true, poll = none};
+poll_reply(#response{documents = Docs}, #pool{active = Active} = Pool) ->
+    case catch check_repl_lag(Docs, Pool) of
+        true ->
+            if Active =:= false ->
+                    log(Pool, <<"activated">>, <<"repl_normal">>);
+               true ->
+                    ok
+            end,
+            Pool#pool{active = true, poll = none};
+        _ ->
+            if Active =:= true ->
+                    log(Pool, <<"deactivated">>, <<"repl_lag">>);
+               true ->
+                    ok
+            end,
+            Pool#pool{active = false, poll = none}
+    end.
+
+packet(Database, ReqId, undefined) ->
+    emongo_packet:get_last_error(Database, ReqId);
+packet(_Database, ReqId, _) ->
+    emongo_packet:rs_status(ReqId).
+
+check_repl_lag(BinDocs, #pool{max_repl_lag = MaxLag}) ->
+    [Doc] = emongo_bson:decode(BinDocs),
+    {_, {array, Members}} = lists:keyfind(<<"members">>, 1, Doc),
+    Fun = fun(_, Val) when Val =:= true; Val =:= false->
+                  Val;
+             (Member, Optime) ->
+                  IsSelf = lists:member({<<"self">>, true}, Member),
+                  IsMaster = lists:member({<<"state">>, 1}, Member),
+                  if IsSelf andalso IsMaster ->
+                          true;
+                     IsSelf orelse IsMaster ->
+                          case lists:keyfind(<<"optimeDate">>, 1, Member) of
+                              {_, TS} when Optime =:= undefined ->
+                                  TS;
+                              {_, TS} ->
+                                  Sign = if IsSelf -> 1;
+                                            IsMaster -> -1
+                                         end,
+                                  Diff = MaxLag * 1000000 - Sign * timer:now_diff(Optime, TS),
+                                  Diff > 0;
+                              false ->
+                                  Optime
+                          end;
+                     true ->
+                          Optime
+                  end
+          end,
+    Res = lists:foldl(Fun, undefined, Members),
+    Res =/= false.
+
+log(#pool{id = PoolId, host = Host, port = Port}, Action, Reason) ->
+    catch emongo:log_string(
+            fun(_) ->
+                    io_lib:format(
+                      "pid=~p\tpool=~p\thost=~s\tport=~p\taction=~s\text=~s",
+                      [self(), PoolId, Host, Port, Action, Reason])
+            end),
+    ok.
