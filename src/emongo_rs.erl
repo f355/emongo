@@ -179,7 +179,7 @@ get_pid(#state{id = RsId, slaves = [Slave | Next], disabled = Disabled, timer = 
             NewState = State#state{slaves = Next,
                                    disabled = [Slave | Disabled],
                                    timer = set_timer(Timer)},
-            log(NewState, "disabled", io_lib:format("\tpool=~s", [Slave])),
+            log(NewState, "disabled", io_lib:format("\tpool=~p", [Slave])),
             get_pid(NewState, Pools, RequestCount, true);
         Res ->
             {Res, State}
@@ -222,7 +222,7 @@ enable(#state{id = RsId, slaves = Slaves, disabled = [PoolIdx | Disabled]} = Sta
             error_logger:info_msg("pool ~p is enabled!~n", [?POOL_ID(RsId, PoolIdx)]),
             NewState = State#state{slaves = lists:umerge([PoolIdx], Slaves),
                                    disabled = Disabled},
-            log(NewState, "enabled", io_lib:format("\tpool=~s", [PoolIdx])),
+            log(NewState, "enabled", io_lib:format("\tpool=~p", [PoolIdx])),
             enable(NewState, Acc, Pools)
     end.
 
